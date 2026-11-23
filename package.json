@@ -1,0 +1,14 @@
+{
+  "name": "searchable-study-platform-cicd",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Searchable Study Platform CI/CD demonstration application",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "start": "node server.js",
+    "test": "node --test",
+    "check": "node --check app.js && node --check server.js && node --check tests/app.test.js"
+  }
+}
