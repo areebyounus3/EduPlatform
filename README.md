@@ -59,7 +59,7 @@ Run `ops/bootstrap-ec2-ubuntu.sh` once using an SSM session or another secure ad
 sudo bash ops/bootstrap-ec2-ubuntu.sh
 ```
 
-The script installs Node.js 24, AWS CLI, Nginx and SSM Agent if needed; creates the `studyapp` service account; and configures systemd and Nginx. It does not create AWS resources or attach IAM roles.
+The script installs Node.js 22, AWS CLI, Nginx and SSM Agent if needed; creates the `studyapp` service account; and configures systemd and Nginx. It does not create AWS resources or attach IAM roles.
 
 For the EC2 security group, allow inbound TCP port 80 only from the audience that needs to view the demo. Do not open port 22 for this SSM-based deployment. The app listens on localhost port 3000 behind Nginx.
 
@@ -71,9 +71,11 @@ In AWS IAM, create an OpenID Connect provider:
 
 ### GitHub deployment role
 
-Create an IAM role trusted by that provider. GitHub repositories created after 15 July 2026 use repository and owner IDs in the default OIDC subject. Use the trust-policy template in `ops/github-oidc-trust-policy-template.json` and replace all placeholders with the actual AWS account ID, owner ID, repository ID and repository name.
+Create an IAM role trusted by that provider. This repository was created after 15 July 2026, so its OIDC subject uses immutable IDs. The trust-policy template already contains the verified subject for this repository:
 
-The owner ID for this GitHub account is `360334793`. The current repository ID is `1469024510`. Verify both values in GitHub before configuring AWS.
+`repo:areebyounus3@360334793/EduPlatform@1469024510:ref:refs/heads/main`
+
+Replace only `AWS_ACCOUNT_ID` in the federated provider ARN with your 12-digit AWS account ID. Do not change the subject unless the repository owner, repository, branch or GitHub OIDC subject format changes.
 
 Attach the permissions in `ops/github-deployment-permissions-template.json`, replacing the bucket, region, AWS account and instance placeholders. Attach `ops/ec2-instance-s3-read-policy-template.json` to the EC2 instance role.
 
