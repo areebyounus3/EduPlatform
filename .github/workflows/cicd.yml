@@ -1,0 +1,138 @@
+name: CI-CD Pipeline
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+permissions:
+  contents: read
+concurrency:
+  group: study-platform-production
+  cancel-in-progress: false
+jobs:
+  test:
+    name: Unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run check
+      - run: npm test
+  security:
+    name: Dependency and secret scanning
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm audit --audit-level=high
+      - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  build-upload:
+    name: Build and upload to S3
+    needs: [test, security]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      S3_BUCKET: ${{ vars.S3_BUCKET }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Package application
+        run: |
+          mkdir -p dist/package
+          cp app.js server.js package.json package-lock.json VERSION dist/package/
+          printf '%s\n' "${GITHUB_SHA}" > dist/package/COMMIT_SHA
+          cp -R public dist/package/
+          cd dist/package && zip -qr ../release.zip .
+          cd .. && sha256sum release.zip > release.zip.sha256
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ vars.AWS_REGION }}
+      - name: Upload immutable artifact
+        run: |
+          test -n "$S3_BUCKET"
+          aws s3 cp dist/release.zip "s3://$S3_BUCKET/releases/$GITHUB_SHA/release.zip"
+          aws s3 cp dist/release.zip.sha256 "s3://$S3_BUCKET/releases/$GITHUB_SHA/release.zip.sha256"
+  deploy:
+    name: Deploy to EC2 and verify production
+    needs: build-upload
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      S3_BUCKET: ${{ vars.S3_BUCKET }}
+      EC2_INSTANCE_ID: ${{ vars.EC2_INSTANCE_ID }}
+      APP_URL: ${{ vars.APP_URL }}
+    steps:
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ vars.AWS_REGION }}
+      - name: Deploy exact artifact through SSM
+        run: |
+          set -euo pipefail
+          test -n "$S3_BUCKET"; test -n "$EC2_INSTANCE_ID"
+          cat > deploy.sh <<'REMOTE'
+          set -euo pipefail
+          B="${S3_BUCKET}"; S="${GITHUB_SHA}"
+          D="/opt/study-platform/releases/$S"
+          aws s3 cp "s3://$B/releases/$S/release.zip" /tmp/release.zip
+          aws s3 cp "s3://$B/releases/$S/release.zip.sha256" /tmp/release.zip.sha256
+          (cd /tmp && sha256sum -c release.zip.sha256)
+          install -d "$D"; unzip -oq /tmp/release.zip -d "$D"
+          chown -R studyapp:studyapp "$D"
+          PREV="$(readlink -f /opt/study-platform/current 2>/dev/null || true)"
+          ln -sfn "$D" /opt/study-platform/current.new
+          mv -Tf /opt/study-platform/current.new /opt/study-platform/current
+          if ! systemctl restart study-platform; then
+            if [ -n "$PREV" ]; then ln -sfn "$PREV" /opt/study-platform/current; systemctl restart study-platform || true; fi
+            exit 1
+          fi
+          for i in $(seq 1 15); do
+            curl -fsS http://127.0.0.1:3000/health | grep -F "$S" && exit 0
+            sleep 2
+          done
+          exit 1
+          REMOTE
+          sed -i "s/\${S3_BUCKET}/$S3_BUCKET/g;s/\${GITHUB_SHA}/$GITHUB_SHA/g" deploy.sh
+          CMD=$(base64 -w0 deploy.sh)
+          PARAMS=$(jq -cn --arg c "echo '$CMD' | base64 -d | bash" '{commands:[$c]}')
+          ID=$(aws ssm send-command --instance-ids "$EC2_INSTANCE_ID" --document-name AWS-RunShellScript --parameters "$PARAMS" --query Command.CommandId --output text)
+          aws ssm wait command-executed --command-id "$ID" --instance-id "$EC2_INSTANCE_ID"
+          aws ssm get-command-invocation --command-id "$ID" --instance-id "$EC2_INSTANCE_ID" --query StandardOutputContent --output text
+      - name: Update latest pointer after successful deployment
+        run: aws s3 cp "s3://$S3_BUCKET/releases/$GITHUB_SHA/release.zip" "s3://$S3_BUCKET/latest/release.zip"
+      - name: Verify live application
+        run: |
+          for i in $(seq 1 12); do
+            if curl -fsS "$APP_URL/health" -o health.json; then
+              grep -F '"status":"ok"' health.json
+              grep -F "\"commit\":\"$GITHUB_SHA\"" health.json
+              exit 0
+            fi
+            sleep 5
+          done
+          exit 1
